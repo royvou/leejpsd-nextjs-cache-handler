@@ -49,9 +49,18 @@ ctx contract are accepted (`ctx.cacheControl.revalidate` / `kind` and
 | `singleFlightLockTtlSec` | `number` | `10` | lock TTL for `singleFlight` |
 | `isBuildPhase` | `() => boolean` | `NEXT_PHASE === "phase-production-build"` | build-phase gate override |
 | `hashTag` | `boolean` | `false` | wrap namespace in `{}` — **required on Redis Cluster** (multi-key Lua) |
-| `tagPubSub` | `boolean` | `false` | push-based cross-instance tag propagation (plural handler; ~3ms); scan polling remains the safety net; unavailable on Cluster |
+| `tagReadMode` | `"scan" \| "on-demand"` | `"scan"` | Cache Components only. `"on-demand"` skips the keyspace scan and reads the existing markers for the tags relevant to the entry or route. |
+| `tagPubSub` | `boolean` | `false` | push-based cross-instance tag propagation (plural handler); Redis tag reads still cover missed notifications; unavailable on Cluster |
 | `onMetric` | `(event: MetricEvent) => void` | — | telemetry hook; emitter errors are swallowed |
 | `logger` | `Logger` | console (warn+) | injectable 4-level logger |
+
+With `tagReadMode: "on-demand"`, Cache Components check the entry and route
+tag markers directly in Redis. The route check in `getExpiration()` can add
+another marker lookup. Pub/Sub can still update local tag state between
+reads. On recovery, the handler drops entries written to memory during the
+outage. It prunes the local tag map at most once per minute for age and in
+batches if it exceeds capacity. Dropping a marker also clears the local
+fallback cache so old entries cannot outlive their invalidations.
 
 ## `RedisClientConfig`
 

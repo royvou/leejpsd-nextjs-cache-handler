@@ -118,7 +118,8 @@ Facts that prevent misdiagnosis:
 | `abortTimeoutMs` | 1500 | Per-op Redis deadline; timeouts degrade to miss |
 | `hashTag: true` | off | REQUIRED on Redis Cluster |
 | `onMetric` | — | Wire `createOtelMetricEmitter()` from `@leejpsd/nextjs-cache-handler/otel` |
-| `tagPubSub: true` | off | 0.4+: push-based cross-instance invalidation (~3ms vs seconds); polling stays as safety net; not on Cluster |
+| `tagReadMode: "on-demand"` | `"scan"` | Cache Components reads only the relevant Redis tag markers and skips request-time scans |
+| `tagPubSub: true` | off | Push-based cross-instance invalidation; scan or on-demand Redis reads cover missed messages. Unavailable on Cluster. |
 
 Reliability built in (0.3+): reconnect with exponential backoff (1s→30s cap),
 bounded memory fallback, per-op timeouts. A Redis outage degrades to

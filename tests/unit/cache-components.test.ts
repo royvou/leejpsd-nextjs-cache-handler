@@ -51,6 +51,106 @@ function setup(opts: { delayMs?: number; failNext?: number } = {}) {
   return { handler, client, events };
 }
 
+function setupOnDemand() {
+  const client = new MockRedisClient();
+  client.isOpen = true;
+  const handler = createCacheComponentsHandler({
+    client: () => client,
+    abortTimeoutMs: 100,
+    tagReadMode: "on-demand",
+  });
+  return { handler, client };
+}
+
+describe("cacheHandlers — on-demand tag reads", () => {
+  it("does not resurrect an outage fallback entry after Redis recovery and a second outage", async () => {
+    const { handler, client } = setupOnDemand();
+    const writer = createCacheComponentsHandler({ client: () => client });
+    await handler.set("k", Promise.resolve(makeEntry({ tags: ["posts"] })));
+
+    // A connection failure puts the connection manager into its 1s cooldown;
+    // set() saves the entry in its bounded memory fallback during the outage.
+    client.isOpen = false;
+    client.failNext(1);
+    await handler.set("k", Promise.resolve(makeEntry({
+      tags: ["posts"], timestamp: T0 + 1,
+    })));
+    await handler.set("other", Promise.resolve(makeEntry({ tags: [] })));
+    expect(await handler.get("k", [])).toBeDefined();
+
+    // A different instance writes the marker, with Pub/Sub disabled.
+    vi.setSystemTime(new Date(T0 + 1_001));
+    client.isOpen = true;
+    await writer.updateTags(["posts"]);
+    expect(await handler.get("k", [])).toBeUndefined();
+    expect(await handler.get("other", [])).toBeUndefined();
+
+    // Another outage must not expose the previously cached fallback copy.
+    client.isOpen = false;
+    client.failNext(1);
+    expect(await handler.get("k", [])).toBeUndefined();
+  });
+
+  it("forgets old local markers beyond the cap and conservatively evicts affected fallback entries", async () => {
+    const { handler, client } = setupOnDemand();
+    const tags = Array.from({ length: 10_001 }, (_, i) => `bulk-${i}`);
+    await handler.updateTags(tags, { expire: 60 });
+
+    // Redis marker deletion models marker expiry/cleanup. A targeted read for
+    // the oldest tag must not be answered forever from the local mirror.
+    const oldestMarker = `next-cache:tag-expiration:unversioned:${tags[0]}`;
+    client.kv.delete(oldestMarker);
+    expect(await handler.getExpiration([tags[0]!])).toBe(0);
+
+    // Put a fallback entry in memory, then force another invalidation while
+    // Redis is down. Cap pruning may forget its marker; that makes the entry
+    // unsafe to serve because its freshness can no longer be established.
+    vi.setSystemTime(new Date(T0 + 10_002));
+    client.isOpen = false;
+    client.failNext(1);
+    await handler.set("old", Promise.resolve(makeEntry()));
+    expect(await handler.get("old", [])).toBeDefined();
+    let finishEntry!: (entry: CacheComponentsEntry) => void;
+    const pending = new Promise<CacheComponentsEntry>((resolve) => {
+      finishEntry = resolve;
+    });
+    const late = handler.set("late", pending);
+    const moreTags = Array.from({ length: 1_100 }, (_, i) => `pressure-${i}`);
+    await handler.updateTags(moreTags, { expire: 60 });
+    expect(await handler.get("old", [])).toBeUndefined();
+    finishEntry(makeEntry());
+    await late;
+    expect(await handler.get("late", [])).toBeUndefined();
+  });
+
+  it("prunes expired local markers on reads after the retention window", async () => {
+    const { handler, client } = setupOnDemand();
+    await handler.updateTags(["posts"]);
+    const futureDeadline = 10 * 24 * 60 * 60;
+    await handler.updateTags(["future"], { expire: futureDeadline });
+    client.kv.delete("next-cache:tag-expiration:unversioned:posts");
+    client.kv.delete("next-cache:tag-expiration:unversioned:future");
+    expect(await handler.getExpiration(["posts"])).toBe(T0);
+
+    vi.setSystemTime(new Date(T0 + 7 * 24 * 60 * 60 * 1_000 + 1));
+    expect(await handler.getExpiration(["posts"])).toBe(0);
+    expect(await handler.getExpiration(["future"])).toBe(T0 + futureDeadline * 1_000);
+  });
+
+  it("uses deduplicated marker reads for targeted lookups and never scans", async () => {
+    const { handler, client } = setupOnDemand();
+    const scan = vi.spyOn(client, "scanIterator");
+    const mGet = vi.spyOn(client, "mGet");
+    await handler.updateTags(["a", "b"]);
+
+    expect(await handler.getExpiration(["a", "a", "b", "a"])).toBe(T0);
+    expect(mGet).toHaveBeenCalledTimes(1);
+    expect(mGet.mock.calls[0]?.[0]).toHaveLength(2);
+    await handler.refreshTags();
+    expect(scan).not.toHaveBeenCalled();
+  });
+});
+
 describe("cacheHandlers — get/set round-trip", () => {
   it("set followed by get returns equivalent entry", async () => {
     const { handler, client } = setup();

@@ -220,6 +220,7 @@ interface CacheHandlerOptions {
   abortTimeoutMs?: number;        // default: 1500
   fallback?: "auto" | "always" | "never";    // default: "auto"
   staleWhileRevalidate?: boolean; // default: true (cache-components only)
+  tagReadMode?: "scan" | "on-demand"; // default: "scan" (cache-components only)
   singleFlight?: boolean;         // default: false — see "Single-flight refresh lock" below
   singleFlightLockTtlSec?: number; // default: 10
   isBuildPhase?: () => boolean;   // override PHASE_PRODUCTION_BUILD detection

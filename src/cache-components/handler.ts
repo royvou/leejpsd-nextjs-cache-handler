@@ -135,6 +135,7 @@ interface HandlerState {
       | "keyPrefix"
       | "singleFlight"
       | "singleFlightLockTtlSec"
+      | "tagReadMode"
       | "tagPubSub"
     >
   > & { rest: CacheHandlerOptions };
@@ -146,11 +147,17 @@ interface HandlerState {
   conn: ConnectionManager;
   /** Memory cache for entries when Redis is unavailable. */
   memEntries: MemoryStore<string>;
+  /** On-demand mode has entries written while the Redis connection was down. */
+  hasOutageEntries: boolean;
+  /** Guards fallback writes that overlap a purge. */
+  fallbackGeneration: number;
   /** Memory tag-set index for memory fallback path. */
   memTags: MemorySetStore;
   /** Memory tag-expiration timestamps. Mirrors next-cache:tag-expiration:*. */
   memTagExp: Map<string, TagState>;
-  /** Local mirror of recent tag invalidations refreshed from Redis. */
+  /** Earliest time for the next age-based on-demand cleanup. */
+  nextTagPruneAt: number;
+  /** Scan-mode mirror of recent tag invalidations refreshed from Redis. */
   localTagTimestamps: Map<string, TagState>;
   /** tagPubSub subscription state (opt-in acceleration; polling remains). */
   pubsub: {
@@ -186,6 +193,7 @@ function init(opts: CacheHandlerOptions): HandlerState {
       hashTag: opts.hashTag ?? false,
       keyPrefix: opts.keyPrefix ?? DEFAULT_KEY_PREFIX,
       singleFlight: opts.singleFlight ?? false,
+      tagReadMode: opts.tagReadMode === "on-demand" ? "on-demand" : "scan",
       tagPubSub: opts.tagPubSub ?? false,
       singleFlightLockTtlSec:
         opts.singleFlightLockTtlSec ?? DEFAULT_LOCK_TTL_SEC,
@@ -195,8 +203,11 @@ function init(opts: CacheHandlerOptions): HandlerState {
     emit,
     conn,
     memEntries: new MemoryStore<string>(opts.memoryMaxEntries),
+    hasOutageEntries: false,
+    fallbackGeneration: 0,
     memTags: new MemorySetStore(opts.memoryMaxEntries),
     memTagExp: new Map(),
+    nextTagPruneAt: 0,
     localTagTimestamps: new Map(),
     pubsub: { active: false, disabled: false, attempting: false, lastAttempt: 0 },
     resolveNs: () => resolveBuildNamespace(opts.buildNamespace),
@@ -234,6 +245,44 @@ function tagExpKey(state: HandlerState, tag: string): string {
     tag,
     state.opts.hashTag
   );
+}
+
+async function readRedisTagStates(
+  state: HandlerState,
+  tags: string[],
+  op: string
+): Promise<(TagState | null)[] | null> {
+  const records = await withAbortSignal(op, state.opts.abortTimeoutMs, async () => {
+    const client = await state.conn.getOrConnect();
+    if (!client) return null;
+    const values = await client.mGet(tags.map((tag) => tagExpKey(state, tag)));
+    return values.map((value) => (value === null ? null : decodeTagMarker(value)));
+  });
+  if (records && state.opts.tagReadMode === "on-demand") {
+    observeRedisSuccess(state);
+    for (const [index, tag] of tags.entries()) {
+      const remote = records[index];
+      const local = state.memTagExp.get(tag);
+      if (remote && (!local || remote.s >= local.s)) state.memTagExp.set(tag, remote);
+    }
+    pruneOnDemandTagStates(state);
+  }
+  return records;
+}
+
+function latestTagState(
+  state: HandlerState,
+  tag: string,
+  remote?: TagState | null
+): TagState | undefined {
+  // The fallback map keeps notifications and local invalidations even if
+  // a scan rebuilt the mirror without them or Redis has not recorded them yet.
+  const local = state.localTagTimestamps.get(tag);
+  const memory = state.memTagExp.get(tag);
+  const latestLocal = local && memory
+    ? (local.s >= memory.s ? local : memory)
+    : (local ?? memory);
+  return remote && (!latestLocal || remote.s >= latestLocal.s) ? remote : latestLocal;
 }
 
 function lockKey(state: HandlerState, cacheKey: string): string {
@@ -311,6 +360,8 @@ async function getImpl(
   softTags: string[]
 ): Promise<CacheComponentsEntry | undefined> {
   const start = Date.now();
+  const onDemand = state.opts.tagReadMode === "on-demand";
+  if (onDemand) pruneOnDemandTagStates(state, start);
   const useRedis = gateRedis(state);
   if (useRedis) void ensureTagSubscription(state);
 
@@ -324,18 +375,22 @@ async function getImpl(
   // Try Redis first when allowed.
   let envelope: ReturnType<typeof decodeEnvelope> = null;
   let raw: string | null = null;
+  let redisReadSucceeded = false;
 
   if (useRedis) {
     try {
-      raw = await withAbortSignal(
+      const stored = await withAbortSignal(
         "cacheHandlers.get",
         state.opts.abortTimeoutMs,
         async () => {
           const client = await state.conn.getOrConnect();
-          if (!client) return null;
+          if (!client) return undefined;
           return await client.get(eKey);
         }
       );
+      redisReadSucceeded = stored !== undefined;
+      if (redisReadSucceeded) observeRedisSuccess(state);
+      raw = stored ?? null;
     } catch (err) {
       if (err instanceof CacheTimeoutError) {
         state.emit({ type: "redis.timeout", meta: { op: "get" } });
@@ -348,7 +403,8 @@ async function getImpl(
     }
   }
 
-  if (raw === null && state.opts.fallback !== "never") {
+  const fromMemory = raw === null;
+  if (fromMemory && state.opts.fallback !== "never") {
     raw = state.memEntries.get(eKey);
     if (raw !== null) state.emit({ type: "fallback.activated", meta: { op: "get" } });
   }
@@ -358,6 +414,7 @@ async function getImpl(
     return undefined;
   }
 
+  const fallbackPayload = onDemand && fromMemory ? raw : null;
   try {
     raw = await decompressValue(raw);
   } catch {
@@ -375,7 +432,9 @@ async function getImpl(
   const partition = partitionEntry(envelope, Date.now());
   if (!shouldServeStale(partition, state.opts.staleWhileRevalidate)) {
     // Hard miss. Best-effort cleanup of the entry.
-    if (useRedis) {
+    if (fallbackPayload !== null) {
+      if (state.memEntries.get(eKey) === fallbackPayload) state.memEntries.delete(eKey);
+    } else if (useRedis) {
       try {
         await withAbortSignal(
           "cacheHandlers.get.evict",
@@ -408,20 +467,30 @@ async function getImpl(
   //      checks the current action's pending/previous tags), so cross-request
   //      soft invalidation — revalidateTag(tag, "max") — is entirely the
   //      handler's job here. Checking only softTags made that a no-op (#1).
-  const freshnessTags =
+  let freshnessTags =
     softTags.length > 0 ? [...softTags, ...envelope.tags] : envelope.tags;
+  let remoteTags: (TagState | null)[] | null = null;
+  if (onDemand && redisReadSucceeded && freshnessTags.length > 0) {
+    freshnessTags = [...new Set(freshnessTags)];
+    try {
+      remoteTags = await readRedisTagStates(state, freshnessTags, "cacheHandlers.get.tags");
+    } catch (err) {
+      if (err instanceof CacheTimeoutError) {
+        state.emit({ type: "redis.timeout", meta: { op: "get.tags" } });
+      }
+    }
+    // Redis entries must pass the marker check. Memory fallback entries may
+    // still use local invalidations when Redis cannot answer.
+    if (!remoteTags && !fromMemory) {
+      state.emit({ type: "cache.miss", meta: { reason: "tag-lookup-failed" } });
+      return undefined;
+    }
+  }
   let tagStale = false;
   if (freshnessTags.length > 0) {
     const now = Date.now();
-    for (const t of freshnessTags) {
-      // memTagExp is folded in deliberately: refreshTags rebuilds
-      // localTagTimestamps wholesale from scanned markers, and a pub/sub
-      // message whose PUBLISHER clock lags the local scanStart can be
-      // rejected by the carry-over while SCAN missed its just-written
-      // marker — memTagExp retains it (size-pruned, never scan-rebuilt).
-      const local = state.localTagTimestamps.get(t);
-      const mem = state.memTagExp.get(t);
-      const st = local && mem ? (local.s >= mem.s ? local : mem) : (local ?? mem);
+    for (const [index, tag] of freshnessTags.entries()) {
+      const st = latestTagState(state, tag, remoteTags?.[index]);
       if (!st || st.s <= envelope.timestamp) continue;
       // Tag invalidated after this entry was written. Hard deadline passed
       // (hard invalidations have e === s, so they land here immediately)
@@ -430,6 +499,9 @@ async function getImpl(
       // because serve-while-refreshing is the upstream contract for
       // profile-based revalidation, not a handler feature toggle.
       if (now >= st.e || partition.freshness === "expired") {
+        if (fallbackPayload !== null && state.memEntries.get(eKey) === fallbackPayload) {
+          state.memEntries.delete(eKey);
+        }
         state.emit({ type: "cache.miss", meta: { reason: "tag-invalidated" } });
         return undefined;
       }
@@ -442,12 +514,20 @@ async function getImpl(
   // For stale entries, try the single-flight refresh lock so only one
   // instance triggers the background refresh (when the option is on).
   // The lock outcome is purely informational — we always serve the entry.
+  const isLeader = freshness === "stale" && state.opts.singleFlight
+    ? await tryAcquireRefreshLock(state, cacheKey)
+    : false;
+  // A concurrent operation can clear the fallback while this read is in flight.
+  if (fallbackPayload !== null && state.memEntries.get(eKey) !== fallbackPayload) {
+    state.emit({ type: "cache.miss", ms: Date.now() - start });
+    return undefined;
+  }
+
   if (freshness === "stale") {
     const staleMeta = tagStale
       ? { freshness, reason: "tag-invalidated" }
       : { freshness };
     if (state.opts.singleFlight) {
-      const isLeader = await tryAcquireRefreshLock(state, cacheKey);
       state.emit({
         type: isLeader
           ? "cache.stale.refresh.leader"
@@ -493,6 +573,8 @@ async function setImpl(
   cacheKey: string,
   pendingEntry: Promise<CacheComponentsEntry>
 ): Promise<void> {
+  const onDemand = state.opts.tagReadMode === "on-demand";
+  const fallbackGeneration = state.fallbackGeneration;
   // Spec mandates awaiting the promise before reading value.
   let entry: CacheComponentsEntry;
   try {
@@ -541,7 +623,10 @@ async function setImpl(
 
   if (!useRedis) {
     state.emit({ type: "build_phase.skip", meta: { op: "set" } });
-    if (state.opts.fallback !== "never") {
+    if (
+      state.opts.fallback !== "never" &&
+      (!onDemand || state.fallbackGeneration === fallbackGeneration)
+    ) {
       state.memEntries.set(eKey, payload, ttl);
       for (const t of entry.tags) {
         state.memTags.sAdd(tagKey(state, t), eKey);
@@ -553,16 +638,20 @@ async function setImpl(
   }
 
   try {
-    await withAbortSignal(
+    const stored = await withAbortSignal(
       "cacheHandlers.set",
       state.opts.abortTimeoutMs,
-      async () => {
+      async (signal) => {
         const client = await state.conn.getOrConnect();
         if (!client) {
-          if (state.opts.fallback !== "never") {
+          if (
+            state.opts.fallback !== "never" &&
+            (!onDemand || (!signal.aborted && state.fallbackGeneration === fallbackGeneration))
+          ) {
             state.memEntries.set(eKey, payload, ttl);
+            if (onDemand) state.hasOutageEntries = true;
           }
-          return;
+          return false;
         }
         // Compress only the Redis-bound copy — the memory fallback keeps the
         // plain payload (local reads shouldn't pay decompress CPU).
@@ -576,8 +665,10 @@ async function setImpl(
         } else {
           await luaSetWithTags(client, state, eKey, wirePayload, ttl, entry.tags);
         }
+        return true;
       }
     );
+    if (stored) observeRedisSuccess(state);
     state.emit({ type: "cache.set", meta: { backend: "redis" } });
   } catch (err) {
     if (err instanceof CacheTimeoutError) {
@@ -622,8 +713,8 @@ const SUBSCRIBE_RETRY_MS = 5000;
 
 /**
  * Lazily establish the invalidation subscription. Failures never surface to
- * callers: the refreshTags() scan remains the consistency safety net, so a
- * missing/broken subscription only costs latency, not correctness.
+ * callers: scans or targeted Redis marker reads still reconcile missed
+ * notifications.
  */
 async function ensureTagSubscription(state: HandlerState): Promise<void> {
   if (
@@ -645,7 +736,7 @@ async function ensureTagSubscription(state: HandlerState): Promise<void> {
     if (typeof client.subscribe !== "function") {
       state.pubsub.disabled = true;
       state.logger.warn(
-        "tagPubSub unavailable on this client (no subscribe support, e.g. Cluster) — falling back to scan-based propagation"
+        "tagPubSub unavailable on this client (no subscribe support, e.g. Cluster); using Redis tag reads"
       );
       return;
     }
@@ -666,13 +757,10 @@ async function ensureTagSubscription(state: HandlerState): Promise<void> {
             s: parsed.ts,
             e: typeof parsed.e === "number" ? parsed.e : Infinity,
           };
-          for (const tag of parsed.t) {
-            mergeTagState(state.localTagTimestamps, tag, incoming);
-            mergeTagState(state.memTagExp, tag, incoming);
+          rememberTagInvalidation(state, parsed.t, incoming);
+          if (state.opts.tagReadMode === "scan") {
+            pruneOldestByTimestamp(state.localTagTimestamps, MAX_LOCAL_TAG_ENTRIES);
           }
-          // #11: keep the mirrors bounded between scans too.
-          pruneOldestByTimestamp(state.localTagTimestamps, MAX_LOCAL_TAG_ENTRIES);
-          pruneOldestByTimestamp(state.memTagExp, MAX_LOCAL_TAG_ENTRIES);
         } catch {
           // Malformed message — ignore; the scan will reconcile.
         }
@@ -700,6 +788,8 @@ async function ensureTagSubscription(state: HandlerState): Promise<void> {
 // ─── refreshTags() ───────────────────────────────────────────────────────────
 
 async function refreshTagsImpl(state: HandlerState): Promise<void> {
+  if (state.opts.tagReadMode === "on-demand") return;
+
   // Per spec §6: errors here MUST be caught.
   if (
     !gateRedis(state)
@@ -776,8 +866,52 @@ function escapeMatch(s: string): string {
   return s.replace(/[\\*?[\]]/g, "\\$&");
 }
 
-/** Cap for the process-local tag-timestamp mirrors. */
 const MAX_LOCAL_TAG_ENTRIES = 10_000;
+const LOCAL_TAG_PRUNE_INTERVAL_MS = 60_000;
+const LOCAL_TAG_PRUNE_BATCH_SIZE = 1_000;
+
+function clearFallbackEntries(state: HandlerState): void {
+  state.memEntries.clear();
+  state.memTags.clear();
+  state.hasOutageEntries = false;
+  state.fallbackGeneration += 1;
+}
+
+function observeRedisSuccess(state: HandlerState): void {
+  if (state.hasOutageEntries) clearFallbackEntries(state);
+}
+
+function rememberTagInvalidation(state: HandlerState, tags: string[], record: TagState): void {
+  const scanMode = state.opts.tagReadMode === "scan";
+  for (const tag of tags) {
+    if (scanMode) mergeTagState(state.localTagTimestamps, tag, record);
+    mergeTagState(state.memTagExp, tag, record);
+  }
+  if (scanMode) pruneOldestByTimestamp(state.memTagExp, MAX_LOCAL_TAG_ENTRIES);
+  else pruneOnDemandTagStates(state);
+}
+
+function pruneOnDemandTagStates(state: HandlerState, now = Date.now()): void {
+  const records = state.memTagExp;
+  const size = records.size;
+  if (size === 0) return;
+
+  if (now >= state.nextTagPruneAt) {
+    state.nextTagPruneAt = now + LOCAL_TAG_PRUNE_INTERVAL_MS;
+    const cutoff = now - TAG_EXP_MARKER_TTL_SEC * 1000;
+    for (const [tag, record] of records) {
+      const lastRelevantTime = Number.isFinite(record.e) ? Math.max(record.s, record.e) : record.s;
+      if (lastRelevantTime <= cutoff) records.delete(tag);
+    }
+  }
+  if (records.size > MAX_LOCAL_TAG_ENTRIES) {
+    pruneOldestByTimestamp(records, MAX_LOCAL_TAG_ENTRIES - LOCAL_TAG_PRUNE_BATCH_SIZE);
+  }
+  // Implicit route tags are supplied at read time. A forgotten marker can
+  // apply to any local entry, so discard fallback entries before using the
+  // remaining tag state.
+  if (records.size < size) clearFallbackEntries(state);
+}
 
 /** Drop the oldest-timestamped entries until the map fits the cap. */
 function pruneOldestByTimestamp(
@@ -808,6 +942,8 @@ async function getExpirationImpl(
   tags: string[]
 ): Promise<number> {
   if (tags.length === 0) return 0;
+  const onDemand = state.opts.tagReadMode === "on-demand";
+  if (onDemand) pruneOnDemandTagStates(state);
 
   // Mirror the built-in handler's getExpiration: report only the HARD
   // deadline (`entry.expired || 0` in default.js). The stale stamp is a
@@ -820,39 +956,28 @@ async function getExpirationImpl(
     const mem = state.memTagExp.get(t);
     if (mem && Number.isFinite(mem.e) && mem.e > max) max = mem.e;
   }
-  if (max > 0) {
+  if (max > 0 && !onDemand) {
     state.emit({ type: "tag.expiration.read", meta: { source: "local", count: tags.length } });
     return max;
   }
 
-  // Cold path: no local hits → consult Redis if reachable.
-  if (
-    !gateRedis(state)
-  ) {
-    return 0;
-  }
+  // On-demand reads consult Redis even if some tags have local timestamps.
+  if (!gateRedis(state)) return max;
 
   try {
-    return await withAbortSignal(
-      "cacheHandlers.getExpiration",
-      state.opts.abortTimeoutMs,
-      async () => {
-        const client = await state.conn.getOrConnect();
-        if (!client) return 0;
-        const keys = tags.map((t) => tagExpKey(state, t));
-        const values = await client.mGet(keys);
-        let m = 0;
-        for (const v of values) {
-          if (!v) continue;
-          const st = decodeTagMarker(v);
-          if (st && Number.isFinite(st.e) && st.e > m) m = st.e;
-        }
-        return m;
-      }
-    );
+    const lookupTags = onDemand ? [...new Set(tags)] : tags;
+    const remoteTags = await readRedisTagStates(state, lookupTags, "cacheHandlers.getExpiration");
+    if (!remoteTags) return max;
+
+    let expiration = 0;
+    for (const [index, tag] of lookupTags.entries()) {
+      const remote = remoteTags[index];
+      const tagState = onDemand ? latestTagState(state, tag, remote) : remote;
+      if (tagState && Number.isFinite(tagState.e)) expiration = Math.max(expiration, tagState.e);
+    }
+    return expiration;
   } catch {
-    // Best-effort. Falling back to 0 is safe (treats tags as never invalidated).
-    return 0;
+    return max;
   }
 }
 
@@ -881,14 +1006,7 @@ async function updateTagsImpl(
   const marker = encodeTagMarker(tagState);
 
   // Local mirror update first — guarantees read-after-write within instance.
-  for (const t of tags) {
-    mergeTagState(state.localTagTimestamps, t, tagState);
-    mergeTagState(state.memTagExp, t, tagState);
-  }
-  // memTagExp has no scan-based rebuild to shed dead tags (refreshTags only
-  // replaces localTagTimestamps), so cap it here against unbounded growth in
-  // high-tag-cardinality apps.
-  pruneOldestByTimestamp(state.memTagExp, MAX_LOCAL_TAG_ENTRIES);
+  rememberTagInvalidation(state, tags, tagState);
 
   if (
     !gateRedis(state)
@@ -911,7 +1029,7 @@ async function updateTagsImpl(
 
   // Soft path: best-effort. Hard path: propagate failure.
   try {
-    await withAbortSignal(
+    const stored = await withAbortSignal(
       "cacheHandlers.updateTags",
       state.opts.abortTimeoutMs,
       async () => {
@@ -922,7 +1040,7 @@ async function updateTagsImpl(
               "[next-cache] hard updateTags requested but Redis unavailable"
             );
           }
-          return;
+          return false;
         }
         // Concurrent fan-out instead of a per-tag await chain: N tags cost
         // ~1 round trip (redis@5 auto-pipelines same-tick commands; ioredis
@@ -942,16 +1060,17 @@ async function updateTagsImpl(
                 })
           )
         );
+        return true;
       }
     );
+    if (stored) observeRedisSuccess(state);
     state.emit({
       type: isHardExpire ? "tag.invalidate.hard" : "tag.invalidate.soft",
       meta: { count: tags.length, backend: "redis" },
     });
     if (state.opts.tagPubSub) {
-      // Best-effort push notification — subscribers converge in ms instead
-      // of at their next refreshTags() scan. Failures are irrelevant to
-      // correctness (markers are already written).
+      // Best-effort push notification. Readers can recover missed messages
+      // from the Redis markers, which were already written.
       try {
         const client = await state.conn.getOrConnect();
         // `e` is the hard deadline (ms). Omitted when Infinity — legacy
@@ -965,7 +1084,7 @@ async function updateTagsImpl(
           )
         );
       } catch {
-        /* scan reconciles */
+        /* Redis reads reconcile missed notifications. */
       }
     }
   } catch (err) {

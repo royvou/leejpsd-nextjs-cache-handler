@@ -235,15 +235,22 @@ export interface CacheHandlerOptions {
   staleWhileRevalidate?: boolean;
 
   /**
+   * Redis tag lookup strategy for Cache Components. `scan` refreshes the
+   * local tag map before requests. `on-demand` reads only the markers for
+   * the relevant entry and route tags. Both modes use the same Redis keys
+   * and marker format. Default: `scan`.
+   */
+  tagReadMode?: "scan" | "on-demand";
+
+  /**
    * Push-based cross-instance tag propagation (plural handler only).
    *
    * When enabled, `updateTags()` publishes invalidations on a namespaced
    * channel and every instance keeps a subscription on a dedicated
    * connection, updating its local tag mirror within milliseconds instead
-   * of waiting for the next `refreshTags()` scan. The scan keeps running as
-   * the consistency safety net, so a dropped subscription degrades to the
-   * default behavior rather than to staleness. Not available on Cluster
-   * clients (falls back to polling with a warning). Default: `false`.
+   * of waiting for the next Redis read. Tag scans or targeted marker reads
+   * still provide consistency if a notification is missed. Not available on
+   * Cluster clients. Default: `false`.
    */
   tagPubSub?: boolean;
 

@@ -187,6 +187,30 @@ for (const adapter of adapters) {
     );
 
     it.skipIf(!reachable)(
+      "on-demand readers see explicit and route invalidations from another handler",
+      async () => {
+        const reader = createCacheComponentsHandler({
+          client: () => client,
+          buildNamespace: () => NAMESPACE,
+          tagReadMode: "on-demand",
+        });
+        const routeTag = "_N_T_/posts";
+        await handler.set(
+          "rt-on-demand",
+          Promise.resolve(makeEntry({ timestamp: Date.now() - 1_000 }))
+        );
+        expect((await reader.get("rt-on-demand", [routeTag]))?.revalidate).toBe(60);
+
+        await handler.updateTags(["posts"], { expire: 60 });
+        expect((await reader.get("rt-on-demand", [routeTag]))?.revalidate).toBe(-1);
+
+        await handler.updateTags([routeTag]);
+        expect(await client.get(`next-cache:entry:${NAMESPACE}:rt-on-demand`)).not.toBeNull();
+        expect(await reader.get("rt-on-demand", [routeTag])).toBeUndefined();
+      }
+    );
+
+    it.skipIf(!reachable)(
       "getExpiration over multiple tags returns the most recent timestamp",
       async () => {
         await handler.updateTags(["a"]);
